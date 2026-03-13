@@ -29,7 +29,7 @@ const DEFAULT_SETTINGS: Settings = {
     excludeWindows: [],
     forwardToTelegram: true,
   },
-  telegram: { token: "", allowedUserIds: [], receiveEnabled: true },
+  telegram: { token: "", allowedUserIds: [], receiveEnabled: true, debounceMs: 0 },
   discord: { token: "", allowedUserIds: [], listenChannels: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
@@ -56,6 +56,9 @@ export interface TelegramConfig {
   allowedUserIds: number[];
   /** When false, skip Telegram polling (incoming messages). Useful for send-only instances. Default: true */
   receiveEnabled: boolean;
+  /** Debounce window in ms. Messages from the same chat arriving within this
+   *  window are merged into a single prompt. 0 = disabled (default). */
+  debounceMs: number;
 }
 
 export interface DiscordConfig {
@@ -172,6 +175,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
       token: raw.telegram?.token ?? "",
       allowedUserIds: raw.telegram?.allowedUserIds ?? [],
       receiveEnabled: raw.telegram?.receiveEnabled !== false,
+      debounceMs: Number.isFinite(raw.telegram?.debounceMs) ? Number(raw.telegram.debounceMs) : 0,
     },
     discord: {
       token: typeof raw.discord?.token === "string" ? raw.discord.token.trim() : "",
