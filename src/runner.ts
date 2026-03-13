@@ -23,8 +23,55 @@ export interface RunResult {
   exitCode: number;
 }
 
-const RATE_LIMIT_PATTERN = /you.ve hit your limit|out of extra usage/i;
+const RATE_LIMIT_PATTERN = /you(?:’|’)ve hit your limit|out of extra usage/i;
 const SIGNATURE_ERROR = /Invalid.*signature.*thinking block/i;
+const RATE_LIMIT_RESET_PATTERN = /resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*\(?\s*UTC\s*\)?/i;
+
+// --- Rate limit state ---
+let rateLimitResetAt: number = 0; // epoch ms; 0 = not rate-limited
+let rateLimitNotified: boolean = false;
+
+function parseRateLimitResetTime(text: string): number | null {
+  const match = text.match(RATE_LIMIT_RESET_PATTERN);
+  if (!match) return null;
+
+  let hours = Number(match[1]);
+  const minutes = match[2] ? Number(match[2]) : 0;
+  const ampm = match[3]?.toLowerCase();
+
+  if (ampm === "pm" && hours < 12) hours += 12;
+  if (ampm === "am" && hours === 12) hours = 0;
+
+  const now = new Date();
+  const reset = new Date(now);
+  reset.setUTCHours(hours, minutes, 0, 0);
+  if (reset.getTime() <= now.getTime()) {
+    reset.setUTCDate(reset.getUTCDate() + 1);
+  }
+  return reset.getTime();
+}
+
+export function isRateLimited(): boolean {
+  if (rateLimitResetAt === 0) return false;
+  if (Date.now() >= rateLimitResetAt) {
+    rateLimitResetAt = 0;
+    rateLimitNotified = false;
+    return false;
+  }
+  return true;
+}
+
+export function getRateLimitResetAt(): number {
+  return rateLimitResetAt;
+}
+
+export function wasRateLimitNotified(): boolean {
+  return rateLimitNotified;
+}
+
+export function markRateLimitNotified(): void {
+  rateLimitNotified = true;
+}
 
 // Serial queue — prevents concurrent --resume on the same session
 let queue: Promise<unknown> = Promise.resolve();
@@ -489,6 +536,17 @@ async function execClaude(name: string, prompt: string, onChunk?: (text: string)
 
     const { result: stdout, stderr, exitCode, sessionId: streamedSessionId } = exec;
     let sessionId = streamedSessionId ?? existing?.sessionId ?? "unknown";
+
+    // Track rate limit state globally so daemon can pause heartbeats/jobs
+    if (exec.isRateLimit) {
+      const combined = stdout + stderr;
+      const resetTime = parseRateLimitResetTime(combined);
+      rateLimitResetAt = resetTime ?? (Date.now() + 60 * 60_000); // fallback: 1 hour
+      rateLimitNotified = false;
+      console.warn(
+        `[${new Date().toLocaleTimeString()}] Rate limit detected. Reset at: ${new Date(rateLimitResetAt).toISOString()}`
+      );
+    }
 
     // Persist session ID — works for both new and resumed (stream-json always emits it)
     if (streamedSessionId && (isNew || streamedSessionId !== existing?.sessionId)) {

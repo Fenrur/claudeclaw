@@ -1,9 +1,9 @@
-import { ensureProjectClaudeMd, run, runUserMessage, runFork, killActive, isMainBusy } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, runFork, killActive, isMainBusy, isRateLimited, getRateLimitResetAt } from "../runner";
 import { getSettings, loadSettings } from "../config";
 import { resetSession } from "../sessions";
-import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt, listSkills } from "../skills";
 import { mkdir, stat } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { extname, basename, join } from "node:path";
 
 // --- Markdown → Telegram HTML conversion (ported from nanobot) ---
@@ -206,6 +206,19 @@ function isImageDocument(document?: TelegramDocument): boolean {
 
 function isAudioDocument(document?: TelegramDocument): boolean {
   return Boolean(document?.mime_type?.startsWith("audio/"));
+}
+
+const TEXT_DOCUMENT_MIME_PREFIXES = ["text/", "application/json", "application/xml", "application/x-yaml", "application/yaml", "application/toml", "application/x-toml"];
+const TEXT_DOCUMENT_EXTENSIONS = [".txt", ".json", ".yaml", ".yml", ".toml", ".xml", ".csv", ".tsv", ".md", ".log", ".ini", ".cfg", ".conf", ".env", ".sh", ".bash", ".py", ".js", ".ts", ".rb", ".go", ".rs", ".java", ".kt", ".c", ".cpp", ".h", ".hpp", ".css", ".html", ".sql", ".dockerfile"];
+
+function isTextDocument(document?: TelegramDocument): boolean {
+  if (!document) return false;
+  if (isImageDocument(document) || isAudioDocument(document)) return false;
+  const mime = document.mime_type ?? "";
+  if (TEXT_DOCUMENT_MIME_PREFIXES.some((p) => mime.startsWith(p))) return true;
+  const ext = extname(document.file_name ?? "").toLowerCase();
+  if (TEXT_DOCUMENT_EXTENSIONS.includes(ext)) return true;
+  return false;
 }
 
 function pickLargestPhoto(photo: TelegramPhotoSize[]): TelegramPhotoSize {
@@ -437,6 +450,40 @@ function extractReactionDirective(text: string): { cleanedText: string; reaction
   return { cleanedText, reactionEmoji };
 }
 
+const VOICE_DIRECTIVE_RE = /\[voice:(\/[^\]\r\n]+)\]/gi;
+
+function extractVoiceDirectives(text: string): { cleanedText: string; voicePaths: string[] } {
+  const voicePaths: string[] = [];
+  const cleanedText = text
+    .replace(VOICE_DIRECTIVE_RE, (_match, path) => {
+      const p = String(path).trim();
+      if (p && existsSync(p)) voicePaths.push(p);
+      return "";
+    })
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return { cleanedText, voicePaths };
+}
+
+async function sendVoiceMessage(token: string, chatId: number, voicePath: string, threadId?: number): Promise<void> {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  if (threadId) form.append("message_thread_id", String(threadId));
+
+  const file = Bun.file(voicePath);
+  form.append("voice", file, voicePath.split("/").pop() ?? "voice.ogg");
+
+  const res = await fetch(`${API_BASE}${token}/sendVoice`, {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Telegram sendVoice: ${res.status} ${res.statusText} — ${body}`);
+  }
+}
+
 async function sendReaction(token: string, chatId: number, messageId: number, emoji: string): Promise<void> {
   await callApi(token, "setMessageReaction", {
     chat_id: chatId,
@@ -632,6 +679,33 @@ async function downloadVoiceFromMessage(token: string, message: TelegramMessage)
   return localPath;
 }
 
+async function downloadDocumentFromMessage(token: string, message: TelegramMessage): Promise<{ path: string; fileName: string; fileSize: number } | null> {
+  const doc = message.document;
+  if (!doc || !isTextDocument(doc)) return null;
+
+  const fileMeta = await callApi<{ ok: boolean; result: TelegramFile }>(token, "getFile", { file_id: doc.file_id });
+  if (!fileMeta.ok || !fileMeta.result.file_path) return null;
+
+  const remotePath = fileMeta.result.file_path;
+  const downloadUrl = `${FILE_API_BASE}${token}/${remotePath}`;
+  const response = await fetch(downloadUrl);
+  if (!response.ok) throw new Error(`Telegram file download failed: ${response.status} ${response.statusText}`);
+
+  const dir = join(process.cwd(), ".claude", "claudeclaw", "inbox", "telegram");
+  await mkdir(dir, { recursive: true });
+
+  const ext = extname(doc.file_name ?? "") || extname(remotePath) || ".txt";
+  const filename = `${message.chat.id}-${message.message_id}-${Date.now()}${ext}`;
+  const localPath = join(dir, filename);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  await Bun.write(localPath, bytes);
+
+  const fileName = doc.file_name ?? filename;
+  debugLog(`Document download: wrote ${bytes.length} bytes to ${localPath} file=${fileName} mime=${doc.mime_type ?? "unknown"}`);
+
+  return { path: localPath, fileName, fileSize: bytes.length };
+}
+
 async function handleMyChatMember(update: TelegramMyChatMemberUpdate): Promise<void> {
   const config = getSettings().telegram;
   const chat = update.chat;
@@ -682,6 +756,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   const isGroup = chatType === "group" || chatType === "supergroup";
   const hasImage = Boolean((message.photo && message.photo.length > 0) || isImageDocument(message.document));
   const hasVoice = Boolean(message.voice || message.audio || isAudioDocument(message.document));
+  const hasTextDoc = Boolean(isTextDocument(message.document));
 
   if (!isPrivate && !isGroup) return;
 
@@ -706,7 +781,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
-  if (!text.trim() && !hasImage && !hasVoice) {
+  if (!text.trim() && !hasImage && !hasVoice && !hasTextDoc) {
     debugLog(`Skip message chat=${chatId} from=${userId ?? "unknown"} reason=empty_text`);
     return;
   }
@@ -792,11 +867,19 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   }
 
   const label = message.from?.username ?? String(userId ?? "unknown");
-  const mediaParts = [hasImage ? "image" : "", hasVoice ? "voice" : ""].filter(Boolean);
+  const mediaParts = [hasImage ? "image" : "", hasVoice ? "voice" : "", hasTextDoc ? "document" : ""].filter(Boolean);
   const mediaSuffix = mediaParts.length > 0 ? ` [${mediaParts.join("+")}]` : "";
   console.log(
     `[${new Date().toLocaleTimeString()}] Telegram ${label}${mediaSuffix}: "${text.slice(0, 60)}${text.length > 60 ? "..." : ""}"`
   );
+
+  // If rate-limited, reply immediately without calling Claude
+  if (isRateLimited()) {
+    const resetAt = new Date(getRateLimitResetAt());
+    const resetStr = resetAt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" });
+    await sendMessage(config.token, chatId, `Usage limit reached. Resets at ${resetStr} UTC. I'll be back after that.`, threadId);
+    return;
+  }
 
   // Keep typing indicator alive while queued/running
   const typingInterval = setInterval(() => sendTyping(config.token, chatId, threadId), 4000);
@@ -805,7 +888,6 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     await sendTyping(config.token, chatId, threadId);
     let imagePath: string | null = null;
     let voicePath: string | null = null;
-    let voiceTranscript: string | null = null;
     if (hasImage) {
       try {
         imagePath = await downloadImageFromMessage(config.token, message);
@@ -816,20 +898,18 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     if (hasVoice) {
       try {
         voicePath = await downloadVoiceFromMessage(config.token, message);
+        if (voicePath) debugLog(`Voice file saved: path=${voicePath}`);
       } catch (err) {
         console.error(`[Telegram] Failed to download voice for ${label}: ${err instanceof Error ? err.message : err}`);
       }
+    }
 
-      if (voicePath) {
-        try {
-          debugLog(`Voice file saved: path=${voicePath}`);
-          voiceTranscript = await transcribeAudioToText(voicePath, {
-            debug: telegramDebug,
-            log: (message) => debugLog(message),
-          });
-        } catch (err) {
-          console.error(`[Telegram] Failed to transcribe voice for ${label}: ${err instanceof Error ? err.message : err}`);
-        }
+    let documentInfo: { path: string; fileName: string; fileSize: number } | null = null;
+    if (hasTextDoc) {
+      try {
+        documentInfo = await downloadDocumentFromMessage(config.token, message);
+      } catch (err) {
+        console.error(`[Telegram] Failed to download document for ${label}: ${err instanceof Error ? err.message : err}`);
       }
     }
 
@@ -863,12 +943,22 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     } else if (hasImage) {
       promptParts.push("The user attached an image, but downloading it failed. Respond and ask them to resend.");
     }
-    if (voiceTranscript) {
-      promptParts.push(`Voice transcript: ${voiceTranscript}`);
-      promptParts.push("The user attached voice audio. Use the transcript as their spoken message.");
+    if (voicePath) {
+      promptParts.push(`Voice file path: ${voicePath}`);
+      promptParts.push("The user sent a voice message. Transcribe it using an available transcription tool, then respond to the transcribed text as their spoken message.");
     } else if (hasVoice) {
       promptParts.push(
-        "The user attached voice audio, but it could not be transcribed. Respond and ask them to resend a clearer clip."
+        "The user attached voice audio, but downloading it failed. Respond and ask them to resend."
+      );
+    }
+    if (documentInfo) {
+      promptParts.push(`Document filename: ${documentInfo.fileName}`);
+      promptParts.push(`Document path: ${documentInfo.path}`);
+      promptParts.push(`Document size: ${documentInfo.fileSize} bytes`);
+      promptParts.push("The user attached a text document. Read this file using the Read tool before responding. Do NOT ask the user to paste the content — you have direct file access.");
+    } else if (hasTextDoc) {
+      promptParts.push(
+        `The user attached a document (${message.document?.file_name ?? "unknown"}), but it could not be downloaded. Ask them to resend or paste the content directly.`
       );
     }
     const prefixedPrompt = promptParts.join("\n");
@@ -897,15 +987,28 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         await sendMessage(config.token, chatId, errText, threadId);
       }
     } else {
-      const { cleanedText: afterReaction, reactionEmoji } = extractReactionDirective(result.stdout || "");
+      const { cleanedText: textAfterReact, reactionEmoji } = extractReactionDirective(result.stdout || "");
       if (reactionEmoji) {
         await sendReaction(config.token, chatId, message.message_id, reactionEmoji).catch((err) => {
           console.error(`[Telegram] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
         });
       }
 
-      // Extract [file:/path/to/file] directives from response
-      const { cleanedText, files } = extractFileDirectives(afterReaction);
+      // Extract [voice:/path] directives
+      const { cleanedText: textAfterVoice, voicePaths } = extractVoiceDirectives(textAfterReact);
+
+      // Extract [file:/path/to/file] directives
+      const { cleanedText, files } = extractFileDirectives(textAfterVoice);
+
+      // Send voice messages
+      for (const vp of voicePaths) {
+        try {
+          await sendVoiceMessage(config.token, chatId, vp, threadId);
+          debugLog(`Voice sent: ${vp}`);
+        } catch (err) {
+          console.error(`[Telegram] Failed to send voice ${vp} for ${label}: ${err instanceof Error ? err.message : err}`);
+        }
+      }
 
       // Send files
       for (const file of files) {
@@ -919,22 +1022,24 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         }
       }
 
-      const finalText = cleanedText || "(empty response)";
-      if (streamMsgId) {
-        const html = markdownToTelegramHtml(normalizeTelegramText(finalText));
-        await callApi(config.token, "editMessageText", {
-          chat_id: chatId, message_id: streamMsgId,
-          text: html.slice(0, 4096), parse_mode: "HTML",
-        }).catch(() => callApi(config.token, "editMessageText", {
-          chat_id: chatId, message_id: streamMsgId,
-          text: finalText.slice(0, 4096),
-        }).catch(() => {
-          if (verbose && hadToolLines) {
-            return sendMessage(config.token, chatId, finalText, threadId);
-          }
-        }));
-      } else {
-        await sendMessage(config.token, chatId, finalText, threadId);
+      const finalText = cleanedText || (voicePaths.length > 0 || files.length > 0 ? "" : "(empty response)");
+      if (finalText) {
+        if (streamMsgId) {
+          const html = markdownToTelegramHtml(normalizeTelegramText(finalText));
+          await callApi(config.token, "editMessageText", {
+            chat_id: chatId, message_id: streamMsgId,
+            text: html.slice(0, 4096), parse_mode: "HTML",
+          }).catch(() => callApi(config.token, "editMessageText", {
+            chat_id: chatId, message_id: streamMsgId,
+            text: finalText.slice(0, 4096),
+          }).catch(() => {
+            if (verbose && hadToolLines) {
+              return sendMessage(config.token, chatId, finalText, threadId);
+            }
+          }));
+        } else {
+          await sendMessage(config.token, chatId, finalText, threadId);
+        }
       }
     }
   } catch (err) {
