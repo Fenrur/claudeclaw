@@ -426,11 +426,11 @@ function makeStreamCallback(
     }
   };
 
-  const waitForStreamMsg = async (): Promise<{ msgId: number | null; hadToolLines: boolean }> => {
+  const waitForStreamMsg = async (): Promise<{ msgId: number | null; hadToolLines: boolean; toolLines: string[] }> => {
     if (timer) { clearTimeout(timer); timer = null; }
     if (initPromise) await initPromise;
     finalized = true;
-    return { msgId: streamMsgId, hadToolLines: toolLines.length > 0 };
+    return { msgId: streamMsgId, hadToolLines: toolLines.length > 0, toolLines: [...toolLines] };
   };
 
   return { onChunk, onToolEvent, waitForStreamMsg };
@@ -967,14 +967,16 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     let result;
     let streamMsgId: number | null = null;
     let hadToolLines = false;
+    let streamToolLines: string[] = [];
     if (busy) {
       result = await runFork(prefixedPrompt);
     } else {
-      const stream = makeStreamCallback(config.token, chatId, threadId, { verbose });
+      const stream = makeStreamCallback(config.token, chatId, threadId, { verbose: true });
       result = await runUserMessage("telegram", prefixedPrompt, stream.onChunk, stream.onToolEvent);
       const streamResult = await stream.waitForStreamMsg();
       streamMsgId = streamResult.msgId;
       hadToolLines = streamResult.hadToolLines;
+      streamToolLines = streamResult.toolLines;
     }
 
     if (result.exitCode !== 0) {
@@ -1024,21 +1026,40 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 
       const finalText = cleanedText || (voicePaths.length > 0 || files.length > 0 ? "" : "(empty response)");
       if (finalText) {
+        // Build a compact tool trace header (like Claude Code's visual)
+        let toolHeader = "";
+        if (hadToolLines && streamToolLines && streamToolLines.length > 0) {
+          const toolNames = streamToolLines
+            .filter((l: string) => l.startsWith("● "))
+            .map((l: string) => {
+              const m = l.match(/● (\w+)\(([^)]*)\)/);
+              return m ? `${m[1]}(${m[2].length > 30 ? m[2].slice(0, 30) + "…" : m[2]})` : null;
+            })
+            .filter(Boolean);
+          if (toolNames.length > 0) {
+            const maxShow = 6;
+            const shown = toolNames.slice(0, maxShow);
+            const rest = toolNames.length - maxShow;
+            toolHeader = "🔧 " + shown.join(" → ") + (rest > 0 ? ` (+${rest} more)` : "") + "\n\n";
+          }
+        }
+        const fullFinal = toolHeader + finalText;
+
         if (streamMsgId) {
-          const html = markdownToTelegramHtml(normalizeTelegramText(finalText));
+          const html = markdownToTelegramHtml(normalizeTelegramText(fullFinal));
           await callApi(config.token, "editMessageText", {
             chat_id: chatId, message_id: streamMsgId,
             text: html.slice(0, 4096), parse_mode: "HTML",
           }).catch(() => callApi(config.token, "editMessageText", {
             chat_id: chatId, message_id: streamMsgId,
-            text: finalText.slice(0, 4096),
+            text: fullFinal.slice(0, 4096),
           }).catch(() => {
-            if (verbose && hadToolLines) {
-              return sendMessage(config.token, chatId, finalText, threadId);
+            if (hadToolLines) {
+              return sendMessage(config.token, chatId, fullFinal, threadId);
             }
           }));
         } else {
-          await sendMessage(config.token, chatId, finalText, threadId);
+          await sendMessage(config.token, chatId, fullFinal, threadId);
         }
       }
     }
