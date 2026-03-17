@@ -65,6 +65,52 @@ function markdownToTelegramHtml(text: string): string {
   return text;
 }
 
+/**
+ * Safe HTML conversion for streaming: handles incomplete markdown that arrives
+ * mid-stream (unclosed code fences, backticks) and ensures all HTML tags are
+ * properly closed so Telegram accepts the output.
+ */
+function streamSafeHtml(text: string): string {
+  if (!text) return "";
+
+  // Phase A: Close incomplete markdown delimiters
+
+  // 1. Unclosed code fences — odd number of ``` means the last one is unclosed
+  const fenceMatches = text.match(/```/g);
+  if (fenceMatches && fenceMatches.length % 2 !== 0) {
+    text = text + "\n```";
+  }
+
+  // 2. Unclosed inline backticks — count backticks outside code blocks
+  const outsideCode = text.replace(/```[\w]*\n?[\s\S]*?```/g, "");
+  const backtickMatches = outsideCode.match(/`/g);
+  if (backtickMatches && backtickMatches.length % 2 !== 0) {
+    text = text + "`";
+  }
+
+  // Phase B: Convert markdown to Telegram HTML
+  let html = markdownToTelegramHtml(text);
+
+  // Phase C: Close any unclosed HTML tags (safety net)
+  const tags: [RegExp, RegExp, string][] = [
+    [/<b>/g, /<\/b>/g, "</b>"],
+    [/<i>/g, /<\/i>/g, "</i>"],
+    [/<s>/g, /<\/s>/g, "</s>"],
+    [/<code>/g, /<\/code>/g, "</code>"],
+    [/<pre>/g, /<\/pre>/g, "</pre>"],
+    [/<a /g, /<\/a>/g, "</a>"],
+  ];
+  for (const [openRe, closeRe, closeTag] of tags) {
+    const openCount = (html.match(openRe) || []).length;
+    const closeCount = (html.match(closeRe) || []).length;
+    for (let j = 0; j < openCount - closeCount; j++) {
+      html += closeTag;
+    }
+  }
+
+  return html;
+}
+
 // --- Telegram Bot API (raw fetch, zero deps) ---
 
 const API_BASE = "https://api.telegram.org/bot";
@@ -367,11 +413,20 @@ function makeStreamCallback(
       display = lines.length > 30 ? `[...]\n${lines.slice(-30).join("\n")}` : textAcc;
     }
     if (!display) return;
+    const html = streamSafeHtml(display);
     callApi(token, "editMessageText", {
       chat_id: chatId,
       message_id: streamMsgId,
-      text: display.slice(0, 4096),
-    }).catch(() => {});
+      text: html.slice(0, 4096),
+      parse_mode: "HTML",
+    }).catch(() => {
+      // Fallback to plain text if Telegram rejects the HTML
+      callApi(token, "editMessageText", {
+        chat_id: chatId,
+        message_id: streamMsgId,
+        text: display.slice(0, 4096),
+      }).catch(() => {});
+    });
   };
 
   const flush = async () => {
