@@ -36,6 +36,7 @@ const DEFAULT_SETTINGS: Settings = {
   stt: { baseUrl: "", model: "" },
   additionalDirs: [],
   timeouts: { telegram: 5, heartbeat: 15, job: 30, default: 5 },
+  session: { autoRotate: true, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
 };
 
 export interface HeartbeatExcludeWindow {
@@ -106,6 +107,7 @@ export interface Settings {
   additionalDirs: string[];
   apiToken?: string;
   timeouts: TimeoutsConfig;
+  session: SessionConfig;
 }
 
 export interface AgenticConfig {
@@ -132,6 +134,13 @@ export interface SttConfig {
   baseUrl: string;
   /** Model name passed to the API (default: "Systran/faster-whisper-large-v3") */
   model: string;
+}
+
+export interface SessionConfig {
+  autoRotate: boolean;
+  maxMessages: number;
+  maxAgeHours: number;
+  summaryPath: string;
 }
 
 let cached: Settings | null = null;
@@ -226,6 +235,12 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
       heartbeat: Number.isFinite(raw.timeouts?.heartbeat) ? Number(raw.timeouts.heartbeat) : 15,
       job: Number.isFinite(raw.timeouts?.job) ? Number(raw.timeouts.job) : 30,
       default: Number.isFinite(raw.timeouts?.default) ? Number(raw.timeouts.default) : 5,
+    },
+    session: {
+      autoRotate: raw.session?.autoRotate ?? true,
+      maxMessages: Number.isFinite(raw.session?.maxMessages) ? Number(raw.session.maxMessages) : 50,
+      maxAgeHours: Number.isFinite(raw.session?.maxAgeHours) ? Number(raw.session.maxAgeHours) : 24,
+      summaryPath: typeof raw.session?.summaryPath === "string" ? raw.session.summaryPath.trim() : "",
     },
   };
 }
