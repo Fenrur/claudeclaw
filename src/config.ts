@@ -35,6 +35,7 @@ const DEFAULT_SETTINGS: Settings = {
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   stt: { baseUrl: "", model: "" },
   additionalDirs: [],
+  timeouts: { telegram: 5, heartbeat: 15, job: 30, default: 5 },
 };
 
 export interface HeartbeatExcludeWindow {
@@ -64,7 +65,6 @@ export interface TelegramConfig {
 export interface DiscordConfig {
   token: string;
   allowedUserIds: string[]; // Discord snowflake IDs exceed Number.MAX_SAFE_INTEGER
-  listenChannels: string[]; // Channel IDs where bot responds to all messages (no mention needed)
 }
 
 export type SecurityLevel =
@@ -77,6 +77,17 @@ export interface SecurityConfig {
   level: SecurityLevel;
   allowedTools: string[];
   disallowedTools: string[];
+}
+
+export interface TimeoutsConfig {
+  /** Max seconds for a telegram message subprocess. Default: 5 min. */
+  telegram: number;
+  /** Max minutes for a heartbeat subprocess. Default: 5 min. */
+  heartbeat: number;
+  /** Max minutes for a scheduled job subprocess. Default: 30 min. */
+  job: number;
+  /** Max minutes for all other subprocesses (bootstrap, trigger, etc). Default: 5 min. */
+  default: number;
 }
 
 export interface Settings {
@@ -94,6 +105,7 @@ export interface Settings {
   stt: SttConfig;
   additionalDirs: string[];
   apiToken?: string;
+  timeouts: TimeoutsConfig;
 }
 
 export interface AgenticConfig {
@@ -184,9 +196,6 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
         : Array.isArray(raw.discord?.allowedUserIds)
           ? raw.discord.allowedUserIds.map(String)
           : [],
-      listenChannels: Array.isArray(raw.discord?.listenChannels)
-        ? raw.discord.listenChannels.map(String)
-        : [],
     },
     security: {
       level,
@@ -212,6 +221,12 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
           .map((d: string) => d.trim())
       : [],
     apiToken: typeof raw.apiToken === "string" && raw.apiToken.trim() ? raw.apiToken.trim() : undefined,
+    timeouts: {
+      telegram: Number.isFinite(raw.timeouts?.telegram) ? Number(raw.timeouts.telegram) : 5,
+      heartbeat: Number.isFinite(raw.timeouts?.heartbeat) ? Number(raw.timeouts.heartbeat) : 15,
+      job: Number.isFinite(raw.timeouts?.job) ? Number(raw.timeouts.job) : 30,
+      default: Number.isFinite(raw.timeouts?.default) ? Number(raw.timeouts.default) : 5,
+    },
   };
 }
 

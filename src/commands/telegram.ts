@@ -980,7 +980,10 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     }
 
     if (result.exitCode !== 0) {
-      const errText = `Error (exit ${result.exitCode}): ${result.stderr || "Unknown error"}`;
+      const isKilled = result.exitCode === 143 || result.exitCode === 137;
+      const errText = isKilled
+        ? `⏱ Request timed out (exit ${result.exitCode}: ${result.exitCode === 143 ? "SIGTERM" : "SIGKILL"}) — the subprocess took too long and was killed. Try again or split into smaller steps.`
+        : `Error (exit ${result.exitCode}): ${result.stderr || "Unknown error"}`;
       if (streamMsgId) {
         await callApi(config.token, "editMessageText", {
           chat_id: chatId, message_id: streamMsgId, text: errText,

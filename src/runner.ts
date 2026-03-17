@@ -17,6 +17,9 @@ const LEGACY_PROJECT_CLAUDE_MD = join(process.cwd(), ".claude", "CLAUDE.md");
 const CLAUDECLAW_BLOCK_START = "<!-- claudeclaw:managed:start -->";
 const CLAUDECLAW_BLOCK_END = "<!-- claudeclaw:managed:end -->";
 
+// Grace period between SIGTERM and SIGKILL when a subprocess times out.
+const SIGKILL_GRACE_MS = 5_000;
+
 export interface RunResult {
   stdout: string;
   stderr: string;
@@ -45,6 +48,7 @@ function parseRateLimitResetTime(text: string): number | null {
   const now = new Date();
   const reset = new Date(now);
   reset.setUTCHours(hours, minutes, 0, 0);
+  // If the reset time is in the past, it means tomorrow
   if (reset.getTime() <= now.getTime()) {
     reset.setUTCDate(reset.getUTCDate() + 1);
   }
@@ -140,12 +144,36 @@ function buildChildEnv(baseEnv: Record<string, string>, model: string, api: stri
   return childEnv;
 }
 
+/**
+ * Resolve the subprocess timeout (in ms) for a given invocation name.
+ * Values are read fresh from settings on every call, so hot-reload works
+ * automatically: edit settings.json and the next subprocess picks it up.
+ *
+ * Name mapping:
+ *   "telegram"  → settings.timeouts.telegram  (default 5 min)
+ *   "heartbeat" → settings.timeouts.heartbeat (default 5 min)
+ *   anything else (jobs, bootstrap, trigger…) → settings.timeouts.job (default 30 min)
+ */
+function resolveTimeoutMs(name: string): number {
+  const t = getSettings().timeouts;
+  let minutes: number;
+  if (name === "telegram") {
+    minutes = t.telegram;
+  } else if (name === "heartbeat") {
+    minutes = t.heartbeat;
+  } else {
+    minutes = t.job;
+  }
+  return minutes * 60_000;
+}
+
 async function runClaudeOnce(
   baseArgs: string[],
   model: string,
   api: string,
-  baseEnv: Record<string, string>
-): Promise<{ rawStdout: string; stderr: string; exitCode: number }> {
+  baseEnv: Record<string, string>,
+  timeoutMs: number
+): Promise<{ rawStdout: string; stderr: string; exitCode: number; timedOut: boolean }> {
   const args = [...baseArgs];
   const normalizedModel = model.trim().toLowerCase();
   if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
@@ -157,6 +185,18 @@ async function runClaudeOnce(
   });
 
   activeProc = proc;
+
+  let timedOut = false;
+  let sigkillTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const killTimer = setTimeout(() => {
+    timedOut = true;
+    try { proc.kill("SIGTERM"); } catch { /* already dead */ }
+    sigkillTimer = setTimeout(() => {
+      try { proc.kill("SIGKILL"); } catch { /* already dead */ }
+    }, SIGKILL_GRACE_MS);
+  }, timeoutMs);
+
   const [rawStdout, stderr] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
@@ -164,10 +204,14 @@ async function runClaudeOnce(
   await proc.exited;
   if (activeProc === proc) activeProc = null;
 
+  clearTimeout(killTimer);
+  if (sigkillTimer !== null) clearTimeout(sigkillTimer);
+
   return {
     rawStdout,
     stderr,
     exitCode: proc.exitCode ?? 1,
+    timedOut,
   };
 }
 
@@ -208,8 +252,9 @@ async function runClaudeStreaming(
   api: string,
   baseEnv: Record<string, string>,
   onChunk?: (text: string) => void,
-  onToolEvent?: (line: string) => void
-): Promise<{ result: string; stderr: string; exitCode: number; sessionId?: string; isRateLimit: boolean }> {
+  onToolEvent?: (line: string) => void,
+  timeoutMs?: number
+): Promise<{ result: string; stderr: string; exitCode: number; sessionId?: string; isRateLimit: boolean; timedOut: boolean }> {
   const args = [...baseArgs];
   const normalizedModel = model.trim().toLowerCase();
   if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
@@ -221,6 +266,21 @@ async function runClaudeStreaming(
   });
 
   activeProc = proc;
+
+  let timedOut = false;
+  let sigkillTimer: ReturnType<typeof setTimeout> | null = null;
+  let killTimer: ReturnType<typeof setTimeout> | null = null;
+
+  if (timeoutMs) {
+    killTimer = setTimeout(() => {
+      timedOut = true;
+      try { proc.kill("SIGTERM"); } catch { /* already dead */ }
+      sigkillTimer = setTimeout(() => {
+        try { proc.kill("SIGKILL"); } catch { /* already dead */ }
+      }, SIGKILL_GRACE_MS);
+    }, timeoutMs);
+  }
+
   const stderrPromise = new Response(proc.stderr).text();
 
   let finalResult = "";
@@ -297,11 +357,14 @@ async function runClaudeStreaming(
   await proc.exited;
   if (activeProc === proc) activeProc = null;
 
+  if (killTimer !== null) clearTimeout(killTimer);
+  if (sigkillTimer !== null) clearTimeout(sigkillTimer);
+
   const stderr = await stderrPromise;
   // Also check stderr for rate limit signals
   if (!isRateLimit) isRateLimit = RATE_LIMIT_PATTERN.test(stderr);
 
-  return { result: finalResult, stderr, exitCode: proc.exitCode ?? 1, sessionId, isRateLimit };
+  return { result: finalResult, stderr, exitCode: proc.exitCode ?? 1, sessionId, isRateLimit, timedOut };
 }
 
 const PROJECT_DIR = process.cwd();
@@ -465,6 +528,9 @@ async function execClaude(name: string, prompt: string, onChunk?: (text: string)
       primaryConfig = { model, api };
     }
 
+    const timeoutMs = resolveTimeoutMs(name);
+    const timeoutMin = timeoutMs / 60_000;
+
     const fallbackConfig: ModelConfig = {
       model: fallback?.model ?? "",
       api: fallback?.api ?? "",
@@ -472,7 +538,7 @@ async function execClaude(name: string, prompt: string, onChunk?: (text: string)
     const securityArgs = buildSecurityArgs(security);
 
     console.log(
-      `[${new Date().toLocaleTimeString()}] Running: ${name} (${isNew ? "new session" : `resume ${existing.sessionId.slice(0, 8)}`}, security: ${security.level})`
+      `[${new Date().toLocaleTimeString()}] Running: ${name} (${isNew ? "new session" : `resume ${existing.sessionId.slice(0, 8)}`}, security: ${security.level}, timeout: ${timeoutMin}m)`
     );
 
     // Always use stream-json — session_id comes from the result event for both new and resumed
@@ -505,25 +571,29 @@ async function execClaude(name: string, prompt: string, onChunk?: (text: string)
     const { CLAUDECODE: _, ...cleanEnv } = process.env;
     const baseEnv = { ...cleanEnv } as Record<string, string>;
 
-    let exec = await runClaudeStreaming(args, primaryConfig.model, primaryConfig.api, baseEnv, onChunk, onToolEvent);
+    let exec = await runClaudeStreaming(args, primaryConfig.model, primaryConfig.api, baseEnv, onChunk, onToolEvent, timeoutMs);
     let usedFallback = false;
 
-    if (exec.isRateLimit && hasModelConfig(fallbackConfig) && !sameModelConfig(primaryConfig, fallbackConfig)) {
+    if (exec.timedOut) {
+      console.warn(
+        `[${new Date().toLocaleTimeString()}] TIMEOUT: ${name} subprocess killed after ${timeoutMin}m (SIGTERM+SIGKILL)`
+      );
+    }
+
+    // Only retry with fallback on rate limit — not on timeout
+    if (!exec.timedOut && exec.isRateLimit && hasModelConfig(fallbackConfig) && !sameModelConfig(primaryConfig, fallbackConfig)) {
       console.warn(
         `[${new Date().toLocaleTimeString()}] Claude limit reached; retrying with fallback${fallbackConfig.model ? ` (${fallbackConfig.model})` : ""}...`
       );
-      // Strip --resume to avoid mixing thinking block signatures from
-      // different providers in the same session history (see issue #18).
       const fallbackArgs = args.filter(
         (a) => a !== "--resume" && a !== existing?.sessionId
       );
-      exec = await runClaudeStreaming(fallbackArgs, fallbackConfig.model, fallbackConfig.api, baseEnv, onChunk, onToolEvent);
+      exec = await runClaudeStreaming(fallbackArgs, fallbackConfig.model, fallbackConfig.api, baseEnv, onChunk, onToolEvent, timeoutMs);
       usedFallback = true;
     }
 
     // Auto-detect corrupted session from thinking block signature mismatch.
-    // Back up the broken session and retry with a fresh one (issue #18).
-    if (exec.exitCode !== 0 && !isNew && SIGNATURE_ERROR.test((exec.result ?? "") + exec.stderr)) {
+    if (!exec.timedOut && exec.exitCode !== 0 && !isNew && SIGNATURE_ERROR.test((exec.result ?? "") + exec.stderr)) {
       const backupName = await backupSession();
       console.warn(
         `[${new Date().toLocaleTimeString()}] Detected corrupted session (thinking block signature mismatch). Backed up to ${backupName}, retrying with fresh session...`
@@ -531,7 +601,7 @@ async function execClaude(name: string, prompt: string, onChunk?: (text: string)
       const freshArgs = args.filter(
         (a) => a !== "--resume" && a !== existing?.sessionId
       );
-      exec = await runClaudeStreaming(freshArgs, primaryConfig.model, primaryConfig.api, baseEnv, onChunk, onToolEvent);
+      exec = await runClaudeStreaming(freshArgs, primaryConfig.model, primaryConfig.api, baseEnv, onChunk, onToolEvent, timeoutMs);
     }
 
     const { result: stdout, stderr, exitCode, sessionId: streamedSessionId } = exec;
@@ -541,7 +611,7 @@ async function execClaude(name: string, prompt: string, onChunk?: (text: string)
     if (exec.isRateLimit) {
       const combined = stdout + stderr;
       const resetTime = parseRateLimitResetTime(combined);
-      rateLimitResetAt = resetTime ?? (Date.now() + 60 * 60_000); // fallback: 1 hour
+      rateLimitResetAt = resetTime ?? (Date.now() + 60 * 60_000);
       rateLimitNotified = false;
       console.warn(
         `[${new Date().toLocaleTimeString()}] Rate limit detected. Reset at: ${new Date(rateLimitResetAt).toISOString()}`
@@ -561,6 +631,7 @@ async function execClaude(name: string, prompt: string, onChunk?: (text: string)
       `Date: ${new Date().toISOString()}`,
       `Session: ${sessionId} (${isNew ? "new" : "resumed"})`,
       `Model config: ${usedFallback ? "fallback" : "primary"}`,
+      `Timeout: ${timeoutMin}m${exec.timedOut ? " [TIMED OUT]" : ""}`,
       ...(agentic.enabled ? [`Task type: ${taskType}`, `Routing: ${routingReasoning}`] : []),
       `Prompt: ${prompt}`,
       `Exit code: ${exitCode}`,
