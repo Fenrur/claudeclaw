@@ -1074,7 +1074,6 @@ export const pageStyles = String.raw`    :root {
     .pill.bad { border-color: #ff7f7f47; }
     .pill.bad .pill-value { color: #ffacac; }
 
-    /* ── Tab navigation ── */
     .tab-nav {
       display: flex;
       gap: 6px;
@@ -1312,6 +1311,31 @@ export const pageStyles = String.raw`    :root {
       padding: 2px 4px;
       margin-top: 4px;
       animation: caret 2s step-end infinite;
+    }
+    .chat-msg-agent {
+      align-self: center;
+      max-width: 90%;
+      background: rgba(90, 130, 170, 0.08);
+      border: 1px solid rgba(90, 130, 170, 0.25);
+      border-radius: 8px;
+      padding: 6px 12px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: #7aaac8;
+      letter-spacing: 0.02em;
+    }
+    .chat-msg-agent-running {
+      color: #8ac0e8;
+      border-color: rgba(100, 160, 200, 0.4);
+    }
+    .chat-msg-agent-done {
+      color: #5a9a7a;
+      border-color: rgba(90, 154, 122, 0.35);
+      background: rgba(90, 154, 122, 0.06);
+    }
+    .chat-agent-spinner {
+      opacity: 0.6;
+      animation: caret 1.2s step-end infinite;
     }
 
     @media (max-width: 640px) {

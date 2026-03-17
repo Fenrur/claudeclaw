@@ -979,7 +979,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
 
     function saveChatHistory() {
       try {
-        var toSave = chatHistory.filter(function(m) { return !m.streaming; });
+        var toSave = chatHistory.filter(function(m) { return !m.streaming && m.agentStatus !== "running"; });
         localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(toSave));
       } catch (_) {}
     }
@@ -1019,6 +1019,14 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
       }
       var elapsedMs = Date.now() - chatStartedAt;
       chatMessages.innerHTML = chatHistory.map(function(msg) {
+        if (msg.role === "agent") {
+          var agentCls = "chat-msg chat-msg-agent" + (msg.agentStatus === "running" ? " chat-msg-agent-running" : " chat-msg-agent-done");
+          return (
+            '<div class="' + agentCls + '">' +
+              '<div class="chat-msg-text">' + esc(msg.text || "") + (msg.agentStatus === "running" ? ' <span class="chat-agent-spinner">…</span>' : "") + "</div>" +
+            "</div>"
+          );
+        }
         var cls = "chat-msg " + (msg.role === "user" ? "chat-msg-user" : "chat-msg-assistant");
         if (msg.streaming) cls += " chat-msg-streaming";
         var meta = "";
@@ -1094,6 +1102,31 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
                 setChatBusy(false);
                 chatHistory[assistantIdx].background = true;
                 renderChatHistory();
+              } else if (ev.type === "agent_spawn") {
+                // A sub-agent was spawned — add an activity bubble
+                chatHistory.push({ role: "agent", agentId: ev.id, text: "🤖 Sub-agent started: " + ev.description, agentStatus: "running" });
+                renderChatHistory();
+              } else if (ev.type === "agent_done") {
+                // Find the matching agent bubble and update it
+                var agentBubble = null;
+                for (var k = chatHistory.length - 1; k >= 0; k--) {
+                  if (chatHistory[k].role === "agent" && chatHistory[k].agentId === ev.id) {
+                    agentBubble = chatHistory[k];
+                    break;
+                  }
+                }
+                if (agentBubble) {
+                  agentBubble.agentStatus = "done";
+                  agentBubble.text = "✅ Sub-agent done: " + ev.description;
+                } else {
+                  chatHistory.push({ role: "agent", agentId: ev.id, text: "✅ Sub-agent done: " + ev.description, agentStatus: "done" });
+                }
+                // Also append result summary to the main assistant bubble if it has text
+                if (ev.result && ev.result.trim()) {
+                  chatHistory.push({ role: "assistant", text: ev.result.trim(), streaming: false, background: false });
+                }
+                renderChatHistory();
+                saveChatHistory();
               } else if (ev.type === "done") {
                 chatHistory[assistantIdx].streaming = false;
                 chatHistory[assistantIdx].background = false;
@@ -1151,6 +1184,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     }
 
     // Update elapsed timer in-place every second (no full re-render = no blink).
+    // CSS animations handle "working in background..." and agent spinner indicators.
     setInterval(function() {
       if (chatBusy && chatMessages) {
         var elapsedEl = chatMessages.querySelector(".chat-msg-elapsed");
