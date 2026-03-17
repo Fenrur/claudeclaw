@@ -1122,6 +1122,9 @@ async function registerBotCommands(token: string): Promise<void> {
     const commands = [
       { command: "start", description: "Show welcome message" },
       { command: "reset", description: "Reset session and start fresh" },
+      { command: "kill", description: "Kill the active Claude process" },
+      { command: "verbose", description: "Toggle tool call display" },
+      { command: "fork", description: "Run on a parallel agent (Haiku)" },
     ];
     for (const skill of skills) {
       // Telegram commands: 1-32 chars, lowercase a-z, 0-9, underscores only
