@@ -111,6 +111,44 @@ function streamSafeHtml(text: string): string {
   return html;
 }
 
+/** Truncate HTML to maxLen without breaking tags or entities, then close unclosed tags. */
+function safeHtmlTruncate(html: string, maxLen: number): string {
+  if (html.length <= maxLen) return html;
+
+  let cut = maxLen;
+
+  // Don't cut inside an HTML tag: if there's an unclosed '<' before cut, back up
+  const lastOpen = html.lastIndexOf("<", cut - 1);
+  const lastClose = html.lastIndexOf(">", cut - 1);
+  if (lastOpen > lastClose) cut = lastOpen;
+
+  // Don't cut inside an HTML entity: if there's an unclosed '&' before cut, back up
+  const lastAmp = html.lastIndexOf("&", cut - 1);
+  const lastSemi = html.lastIndexOf(";", cut - 1);
+  if (lastAmp > lastSemi) cut = lastAmp;
+
+  let result = html.slice(0, cut);
+
+  // Close any unclosed HTML tags (same logic as streamSafeHtml Phase C)
+  const tagPairs: [RegExp, RegExp, string][] = [
+    [/<b>/g, /<\/b>/g, "</b>"],
+    [/<i>/g, /<\/i>/g, "</i>"],
+    [/<s>/g, /<\/s>/g, "</s>"],
+    [/<code>/g, /<\/code>/g, "</code>"],
+    [/<pre>/g, /<\/pre>/g, "</pre>"],
+    [/<a /g, /<\/a>/g, "</a>"],
+  ];
+  for (const [openRe, closeRe, closeTag] of tagPairs) {
+    const openCount = (result.match(openRe) || []).length;
+    const closeCount = (result.match(closeRe) || []).length;
+    for (let j = 0; j < openCount - closeCount; j++) {
+      result += closeTag;
+    }
+  }
+
+  return result;
+}
+
 // --- Telegram Bot API (raw fetch, zero deps) ---
 
 const API_BASE = "https://api.telegram.org/bot";
@@ -331,13 +369,18 @@ async function callApi<T>(token: string, method: string, body?: Record<string, u
 
 async function sendMessage(token: string, chatId: number, text: string, threadId?: number): Promise<void> {
   const normalized = normalizeTelegramText(text).replace(/\[react:[^\]\r\n]+\]/gi, "");
-  const html = markdownToTelegramHtml(normalized);
   const MAX_LEN = 4096;
-  for (let i = 0; i < html.length; i += MAX_LEN) {
+
+  // Chunk the plain text first, then convert each chunk to HTML independently.
+  // This avoids offset mismatches (html vs normalized have different lengths)
+  // and ensures each chunk has balanced HTML tags.
+  for (let i = 0; i < normalized.length; i += MAX_LEN) {
+    const chunk = normalized.slice(i, i + MAX_LEN);
+    const chunkHtml = safeHtmlTruncate(markdownToTelegramHtml(chunk), MAX_LEN);
     try {
       await callApi(token, "sendMessage", {
         chat_id: chatId,
-        text: html.slice(i, i + MAX_LEN),
+        text: chunkHtml,
         parse_mode: "HTML",
         ...(threadId ? { message_thread_id: threadId } : {}),
       });
@@ -345,7 +388,7 @@ async function sendMessage(token: string, chatId: number, text: string, threadId
       // Fallback to plain text if HTML parsing fails
       await callApi(token, "sendMessage", {
         chat_id: chatId,
-        text: normalized.slice(i, i + MAX_LEN),
+        text: chunk,
         ...(threadId ? { message_thread_id: threadId } : {}),
       });
     }
@@ -383,6 +426,7 @@ function makeStreamCallback(
   let streamMsgId: number | null = null;
   let initPromise: Promise<void> | null = null;
   let finalized = false;
+  let editChain: Promise<void> = Promise.resolve();
 
   const getDisplay = () => {
     const MAX_TOOL_LINES = 8;
@@ -413,20 +457,25 @@ function makeStreamCallback(
       display = lines.length > 30 ? `[...]\n${lines.slice(-30).join("\n")}` : textAcc;
     }
     if (!display) return;
-    const html = streamSafeHtml(display);
-    callApi(token, "editMessageText", {
-      chat_id: chatId,
-      message_id: streamMsgId,
-      text: html.slice(0, 4096),
-      parse_mode: "HTML",
-    }).catch(() => {
-      // Fallback to plain text if Telegram rejects the HTML
+    const html = safeHtmlTruncate(streamSafeHtml(display), 4096);
+    const plainFallback = display.slice(0, 4096);
+
+    // Chain edits to prevent race conditions (out-of-order delivery)
+    editChain = editChain.then(() =>
       callApi(token, "editMessageText", {
         chat_id: chatId,
         message_id: streamMsgId,
-        text: display.slice(0, 4096),
-      }).catch(() => {});
-    });
+        text: html,
+        parse_mode: "HTML",
+      }).catch(() =>
+        // Fallback to plain text if Telegram rejects the HTML
+        callApi(token, "editMessageText", {
+          chat_id: chatId,
+          message_id: streamMsgId,
+          text: plainFallback,
+        }).catch(() => {})
+      )
+    );
   };
 
   const flush = async () => {
@@ -484,6 +533,7 @@ function makeStreamCallback(
   const waitForStreamMsg = async (): Promise<{ msgId: number | null; hadToolLines: boolean; toolLines: string[] }> => {
     if (timer) { clearTimeout(timer); timer = null; }
     if (initPromise) await initPromise;
+    await editChain; // ensure last streaming edit completes before final edit
     finalized = true;
     return { msgId: streamMsgId, hadToolLines: toolLines.length > 0, toolLines: [...toolLines] };
   };
@@ -1107,7 +1157,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
           const html = markdownToTelegramHtml(normalizeTelegramText(fullFinal));
           await callApi(config.token, "editMessageText", {
             chat_id: chatId, message_id: streamMsgId,
-            text: html.slice(0, 4096), parse_mode: "HTML",
+            text: safeHtmlTruncate(html, 4096), parse_mode: "HTML",
           }).catch(() => callApi(config.token, "editMessageText", {
             chat_id: chatId, message_id: streamMsgId,
             text: fullFinal.slice(0, 4096),
