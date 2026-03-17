@@ -7,6 +7,7 @@ import { readHeartbeatSettings, updateHeartbeatSettings } from "./services/setti
 import { createQuickJob, deleteJob } from "./services/jobs";
 import { readLogs } from "./services/logs";
 import { runUserMessage } from "../runner";
+import { readKanban, writeKanban, type KanbanBoard } from "./services/kanban";
 
 export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
   const server = Bun.serve({
@@ -213,6 +214,20 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
               "X-Accel-Buffering": "no",
             },
           });
+        } catch (err) {
+          return json({ ok: false, error: String(err) });
+        }
+      }
+
+      if (url.pathname === "/api/kanban" && req.method === "GET") {
+        return json(await readKanban());
+      }
+
+      if (url.pathname === "/api/kanban" && req.method === "POST") {
+        try {
+          const body = await req.json() as KanbanBoard;
+          await writeKanban(body);
+          return json({ ok: true });
         } catch (err) {
           return json({ ok: false, error: String(err) });
         }
